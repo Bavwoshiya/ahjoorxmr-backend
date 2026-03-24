@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { GroupsController } from './groups.controller';
+import { GroupsV2Controller } from './groups-v2.controller';
 import { GroupsService } from './groups.service';
 import { Group } from './entities/group.entity';
 import { Membership } from '../memberships/entities/membership.entity';
@@ -20,8 +21,8 @@ import { StellarModule } from '../stellar/stellar.module';
     NotificationsModule,
     StellarModule,
   ],
-  controllers: [GroupsController],
+  controllers: [GroupsController, GroupsV2Controller],
   providers: [GroupsService, WinstonLogger, JwtAuthGuard],
   exports: [GroupsService],
 })
-export class GroupsModule {}
+export class GroupsModule { }

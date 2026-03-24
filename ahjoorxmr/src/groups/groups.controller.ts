@@ -16,6 +16,7 @@ import {
   DefaultValuePipe,
   ParseBoolPipe,
   Version,
+  SetMetadata,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -25,6 +26,7 @@ import {
   ApiParam,
   ApiQuery,
   ApiBody,
+  ApiDeprecatedResponse,
 } from '@nestjs/swagger';
 import { GroupsService } from './groups.service';
 import { CreateGroupDto } from './dto/create-group.dto';
@@ -44,14 +46,20 @@ import { ErrorResponseDto } from '../common/dto/error-response.dto';
  * Controller for managing ROSCA groups.
  * Provides REST API endpoints for creating, listing, fetching, and updating groups.
  *
+ * DEPRECATED: This is API v1. Use /api/v2/groups for the new version.
+ * Breaking changes in v2:
+ * - GET /api/v2/groups/:id no longer includes members
+ * - Use GET /api/v2/groups/:id/members for member data
+ *
  * IMPORTANT: The GET /my route is declared BEFORE GET /:id to prevent
  * NestJS from treating "my" as a UUID parameter.
  */
 @ApiTags('Groups')
 @Controller('groups')
 @Version('1')
+@SetMetadata('deprecated', true)
 export class GroupsController {
-  constructor(private readonly groupsService: GroupsService) {}
+  constructor(private readonly groupsService: GroupsService) { }
 
   /**
    * Creates a new ROSCA group with status PENDING.

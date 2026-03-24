@@ -24,6 +24,12 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     if (!user) {
       throw new UnauthorizedException();
     }
+
+    // Check if token version matches - if not, token has been revoked
+    if (payload.tokenVersion !== user.tokenVersion) {
+      throw new UnauthorizedException('Token version mismatch - session revoked');
+    }
+
     return { id: user.id, email: user.email, role: user.role };
   }
 }

@@ -38,7 +38,7 @@ export class AuthController {
   constructor(
     private readonly authService: AuthService,
     private readonly twoFactorService: TwoFactorService,
-  ) {}
+  ) { }
 
   @Post('login')
   @Version('1')
@@ -110,6 +110,27 @@ export class AuthController {
     } catch {
       throw new UnauthorizedException('Invalid refresh token');
     }
+  }
+
+  @Post('logout')
+  @Version('1')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({
+    summary: 'Logout user',
+    description: 'Invalidate all refresh tokens and end all sessions.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Logout successful',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized',
+  })
+  async logout(@Req() req: any): Promise<{ message: string }> {
+    await this.authService.logout(req.user.id);
+    return { message: 'Logout successful' };
   }
 
   @Post('reset-password')

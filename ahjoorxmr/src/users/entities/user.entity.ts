@@ -1,4 +1,5 @@
 import { Entity, Column, OneToMany, Index } from 'typeorm';
+import { Exclude, Expose } from 'class-transformer';
 import { BaseEntity } from '../../common/entities/base.entity';
 import { Membership } from '../../memberships/entities/membership.entity';
 import { KycStatus } from '../../kyc/entities/kyc-status.enum';
@@ -29,6 +30,7 @@ export class User extends BaseEntity {
   @Column({ type: 'varchar', length: 255, nullable: true })
   username?: string | null;
 
+  @Exclude()
   @Column({ type: 'varchar', length: 255, nullable: true })
   password?: string | null;
 
@@ -39,19 +41,23 @@ export class User extends BaseEntity {
   })
   role: 'admin' | 'user' | 'guest';
 
+  @Exclude()
   @Column({ type: 'varchar', length: 255, nullable: true })
   refreshTokenHash?: string | null;
 
+  @Exclude()
   @Column({ type: 'integer', default: 0 })
   tokenVersion: number;
 
   // Two-Factor Authentication
+  @Exclude()
   @Column({ type: 'varchar', length: 255, nullable: true })
   twoFactorSecret?: string | null;
 
   @Column({ type: 'boolean', default: false })
   twoFactorEnabled: boolean;
 
+  @Exclude()
   @Column({ type: 'text', array: true, nullable: true })
   backupCodes?: string[] | null;
 

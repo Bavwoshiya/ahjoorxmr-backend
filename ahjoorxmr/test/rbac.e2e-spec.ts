@@ -54,13 +54,6 @@ describe('RBAC E2E Tests', () => {
       },
     );
   });
-      {
-        privateKey: configService.get<string>('JWT_PRIVATE_KEY'),
-        algorithm: 'RS256',
-        expiresIn: '1h',
-      },
-    );
-  });
 
   afterAll(async () => {
     await app.close();

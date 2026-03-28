@@ -6,6 +6,7 @@ import {
   BadGatewayException,
   ConflictException,
 } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -127,6 +128,10 @@ export class PayoutService {
         group.contractAddress,
         recipient.walletAddress,
         group.contributionAmount,
+        async (calculatedHash: string) => {
+          payoutTransaction.txHash = calculatedHash;
+          await this.payoutTransactionRepository.save(payoutTransaction);
+        }
       );
 
       payoutTransaction.txHash = txHash;
@@ -199,5 +204,27 @@ export class PayoutService {
 
   private buildPayoutOrderId(groupId: string, round: number): string {
     return `${groupId}:${round}`;
+  }
+
+  @Cron(CronExpression.EVERY_5_MINUTES)
+  async pollUnconfirmedPayouts() {
+    this.logger.log('Polling unconfirmed payout transactions for reconciliation...');
+    const unconfirmedTransactions = await this.payoutTransactionRepository.find({
+      where: [
+        { status: PayoutTransactionStatus.SUBMITTED },
+        { status: PayoutTransactionStatus.PENDING_SUBMISSION },
+      ],
+    });
+
+    const toProcess = unconfirmedTransactions.filter(
+      (tx) => tx.txHash !== null
+    );
+
+    for (const transaction of toProcess) {
+      this.logger.debug(`Enqueuing reconciliation for payoutTransaction ${transaction.id}`);
+      await this.queueService.addPayoutReconciliation({
+        payoutTransactionId: transaction.id,
+      });
+    }
   }
 }

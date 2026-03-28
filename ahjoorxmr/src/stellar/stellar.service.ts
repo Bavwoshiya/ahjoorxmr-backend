@@ -63,6 +63,7 @@ export class StellarService {
     contractAddress: string,
     recipientWallet: string,
     amount: string,
+    onBeforeSubmit?: (txHash: string) => Promise<void>,
   ): Promise<string> {
     if (!contractAddress) {
       throw new BadRequestException(
@@ -120,9 +121,21 @@ export class StellarService {
         tx = await this.server.prepareTransaction(tx);
       }
 
+      let txHashToStore = typeof (tx as any).hash === 'function' ? (tx as any).hash().toString('hex') : null;
+      if (!txHashToStore && (tx as any).id) {
+         txHashToStore = (tx as any).id;
+      }
+      if (!txHashToStore) {
+         txHashToStore = `temp_hash_${Date.now()}`;
+      }
+
+      if (onBeforeSubmit) {
+        await onBeforeSubmit(txHashToStore);
+      }
+
       const result = await this.server.sendTransaction(tx);
       const txHash: string =
-        result?.hash ?? result?.id ?? result?.transactionHash ?? String(result);
+        result?.hash ?? result?.id ?? result?.transactionHash ?? txHashToStore ?? String(result);
 
       if (!txHash) {
         throw new Error('No transaction hash returned from Stellar RPC');

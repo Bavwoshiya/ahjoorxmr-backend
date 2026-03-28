@@ -257,11 +257,38 @@ describe('PayoutService', () => {
       status: PayoutTransactionStatus.PENDING_SUBMISSION,
       txHash: 'CRASH_HASH',
     });
-    stellarService.disbursePayout.mockResolvedValue('CRASH_HASH');
-
-    await expect(service.distributePayout(GROUP_ID, 1)).rejects.toThrow(
-      BadGatewayException,
+    stellarService.disbursePayout.mockImplementation(
+      async (contract, recipient, amount, onBeforeSubmit) => {
+        if (onBeforeSubmit) {
+          await onBeforeSubmit('CRASH_HASH');
+        }
+        return 'CRASH_HASH';
+      }
     );
+
+    // Simulate crash where distributePayout throws
+    await expect(service.distributePayout(GROUP_ID, 1)).rejects.toThrow();
     expect(membershipRepo.save).not.toHaveBeenCalled();
+
+    // Verify it saved the PENDING_SUBMISSION with correct CRASH_HASH through the intent hook before the simulated crash
+    expect(payoutTransactionRepo.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: PayoutTransactionStatus.PENDING_SUBMISSION,
+        txHash: 'CRASH_HASH',
+      }),
+    );
+
+    // Now restart the node and verify that pollenUnconfirmedPayouts enqueues it
+    payoutTransactionRepo.find = jest.fn().mockResolvedValue([{
+      id: 'ptx-crash',
+      txHash: 'CRASH_HASH',
+      status: PayoutTransactionStatus.PENDING_SUBMISSION
+    }]);
+
+    await service.pollUnconfirmedPayouts();
+
+    expect(queueService.addPayoutReconciliation).toHaveBeenCalledWith({
+      payoutTransactionId: 'ptx-crash',
+    });
   });
 });

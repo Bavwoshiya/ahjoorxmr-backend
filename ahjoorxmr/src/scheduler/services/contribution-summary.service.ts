@@ -12,12 +12,6 @@ interface ContributionSummary {
   totalContributions: number;
   totalAmount: string;
   memberCount: number;
-  contributions: {
-    userId: string;
-    walletAddress: string;
-    amount: string;
-    roundNumber: number;
-  }[];
 }
 
 interface ProgressJob {
@@ -39,53 +33,38 @@ export class ContributionSummaryService {
   ) {}
 
   /**
-   * Generate weekly contribution summaries for all active groups
+   * Generate weekly contribution summaries for all active groups.
+   *
+   * Uses DB-side GROUP BY / SUM aggregation per group — no row-level data is
+   * loaded into the JS heap. A heap-usage guard fires after each group; if the
+   * threshold is exceeded processing halts and a structured alert is emitted.
    */
   async generateWeeklySummaries(
     job?: ProgressJob,
   ): Promise<ContributionSummary[]> {
     const weekAgo = new Date();
     weekAgo.setDate(weekAgo.getDate() - 7);
-    const batchSize = Number(
-      this.configService.get<string>('SUMMARY_BATCH_SIZE', '500'),
-    );
+
+    // Read env-var config (defaults documented in .env.example)
+    // SUMMARY_BATCH_SIZE is retained for env-var contract compatibility.
+    this.configService.get<string>('SUMMARY_BATCH_SIZE', '500');
     const maxHeapMb = Number(
       this.configService.get<string>('SCHEDULER_MAX_HEAP_MB', '512'),
     );
 
     try {
-      // Get all active groups
       const groups = await this.groupRepository.find({
         where: { status: 'ACTIVE' as any },
       });
 
       const summaries: ContributionSummary[] = [];
-      let totalRows = 0;
-
-      for (const group of groups) {
-        const summaryMetrics = await this.contributionRepository
-          .createQueryBuilder('c')
-          .select('COUNT(*)', 'totalContributions')
-          .addSelect(
-            'COALESCE(SUM(CAST(c.amount AS NUMERIC)), 0)',
-            'totalAmount',
-          )
-          .where('c.groupId = :groupId', { groupId: group.id })
-          .andWhere('c.createdAt >= :weekAgo', { weekAgo })
-          .getRawOne<{ totalcontributions?: string; totalamount?: string }>();
-
-        totalRows += Number(summaryMetrics?.totalcontributions ?? 0);
-      }
-
-      let processedRows = 0;
+      const totalGroups = groups.length;
       let stopForMemoryPressure = false;
 
-      for (const group of groups) {
-        // Get member count
-        const memberCount = await this.membershipRepository.count({
-          where: { groupId: group.id },
-        });
+      for (let i = 0; i < groups.length; i++) {
+        const group = groups[i];
 
+        // DB-side aggregation — no row-level data enters the heap
         const aggregate = await this.contributionRepository
           .createQueryBuilder('c')
           .select('COUNT(*)', 'totalContributions')
@@ -100,77 +79,9 @@ export class ContributionSummaryService {
         const totalContributions = Number(aggregate?.totalcontributions ?? 0);
         const totalAmount = String(aggregate?.totalamount ?? '0');
 
-        const contributions: ContributionSummary['contributions'] = [];
-        let offset = 0;
-
-        while (offset < totalContributions) {
-          const batch = await this.contributionRepository
-            .createQueryBuilder('c')
-            .select([
-              'c.userId',
-              'c.walletAddress',
-              'c.amount',
-              'c.roundNumber',
-            ])
-            .where('c.groupId = :groupId', { groupId: group.id })
-            .andWhere('c.createdAt >= :weekAgo', { weekAgo })
-            .orderBy('c.createdAt', 'DESC')
-            .offset(offset)
-            .limit(batchSize)
-            .getMany();
-
-          contributions.push(
-            ...batch.map((c) => ({
-              userId: c.userId,
-              walletAddress: c.walletAddress,
-              amount: c.amount,
-              roundNumber: c.roundNumber,
-            })),
-          );
-
-          processedRows += batch.length;
-          offset += batch.length;
-
-          if (job && totalRows > 0) {
-            const progress = Math.min(
-              100,
-              Math.round((processedRows / totalRows) * 100),
-            );
-            await job.updateProgress(progress);
-          }
-
-          const heapUsedMb = process.memoryUsage().heapUsed / (1024 * 1024);
-          if (heapUsedMb > maxHeapMb) {
-            const alertPayload = {
-              event: 'scheduler_memory_guard_triggered',
-              groupId: group.id,
-              heapUsedMb: Number(heapUsedMb.toFixed(2)),
-              thresholdMb: maxHeapMb,
-            };
-            this.logger.error(JSON.stringify(alertPayload));
-
-            const webhook = this.configService.get<string>(
-              'SCHEDULER_MEMORY_ALERT_WEBHOOK',
-            );
-            if (webhook) {
-              await fetch(webhook, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(alertPayload),
-              }).catch((error) => {
-                this.logger.warn(
-                  `Failed to send scheduler memory alert webhook: ${(error as Error).message}`,
-                );
-              });
-            }
-
-            stopForMemoryPressure = true;
-            break;
-          }
-
-          // Release references early between batches to reduce peak heap pressure.
-          batch.length = 0;
-        }
+        const memberCount = await this.membershipRepository.count({
+          where: { groupId: group.id },
+        });
 
         summaries.push({
           groupId: group.id,
@@ -178,8 +89,43 @@ export class ContributionSummaryService {
           totalContributions,
           totalAmount,
           memberCount,
-          contributions,
         });
+
+        // Report group-based progress to BullMQ dashboard
+        if (job && totalGroups > 0) {
+          await job.updateProgress(
+            Math.min(100, Math.round(((i + 1) / totalGroups) * 100)),
+          );
+        }
+
+        // Heap guard — fires before any further allocation
+        const heapUsedMb = process.memoryUsage().heapUsed / (1024 * 1024);
+        if (heapUsedMb > maxHeapMb) {
+          const alertPayload = {
+            event: 'scheduler_memory_guard_triggered',
+            groupId: group.id,
+            heapUsedMb: Number(heapUsedMb.toFixed(2)),
+            thresholdMb: maxHeapMb,
+          };
+          this.logger.error(JSON.stringify(alertPayload));
+
+          const webhook = this.configService.get<string>(
+            'SCHEDULER_MEMORY_ALERT_WEBHOOK',
+          );
+          if (webhook) {
+            await fetch(webhook, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(alertPayload),
+            }).catch((err) => {
+              this.logger.warn(
+                `Failed to send scheduler memory alert webhook: ${(err as Error).message}`,
+              );
+            });
+          }
+
+          stopForMemoryPressure = true;
+        }
 
         if (stopForMemoryPressure) {
           this.logger.warn(

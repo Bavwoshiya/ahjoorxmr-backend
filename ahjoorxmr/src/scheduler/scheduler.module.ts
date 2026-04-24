@@ -23,6 +23,7 @@ import { BullModule } from '@nestjs/bullmq';
 import { QUEUE_NAMES } from '../bullmq/queue.constants';
 import { QueueService } from '../bullmq/queue.service';
 import { ProfileCompletenessService } from '../users/services/profile-completeness.service';
+import { PenaltiesModule } from '../penalties/penalties.module';
 
 @Module({
   imports: [
@@ -37,6 +38,7 @@ import { ProfileCompletenessService } from '../users/services/profile-completene
     ),
     GroupsModule,
     NotificationsModule,
+    PenaltiesModule,
   ],
   providers: [
     SchedulerService,

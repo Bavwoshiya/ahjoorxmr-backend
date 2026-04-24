@@ -10,6 +10,7 @@ import { GroupStatusService } from './services/group-status.service';
 import { StaleGroupDetectionService } from './services/stale-group-detection.service';
 import { RoundAdvanceService } from './services/round-advance.service';
 import { ProfileIncompleteReminderService } from './services/profile-incomplete-reminder.service';
+import { PenaltyAssessmentJob } from '../penalties/services/penalty-assessment.job';
 import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { GroupInviteService } from '../groups/invites/group-invite.service';
 
@@ -27,6 +28,7 @@ export class SchedulerService {
     private readonly staleGroupDetectionService: StaleGroupDetectionService,
     private readonly roundAdvanceService: RoundAdvanceService,
     private readonly profileIncompleteReminderService: ProfileIncompleteReminderService,
+    private readonly penaltyAssessmentJob: PenaltyAssessmentJob,
     private readonly configService: ConfigService,
     private readonly groupInviteService: GroupInviteService,
     @InjectRepository(RefreshToken)
@@ -298,6 +300,39 @@ export class SchedulerService {
     if (result) {
       this.logger.log(
         `Task ${taskName} completed successfully in ${duration}ms. Sent ${result.sentCount} reminders.`,
+      );
+    } else {
+      this.logger.warn(`Task ${taskName} was skipped (lock not acquired)`);
+    }
+  }
+
+  /**
+   * Daily task: Assess penalties for missed contributions (runs at 6 AM)
+   * Assesses penalties for members who missed their contribution deadline.
+   * Penalties are calculated as: amount × rate × daysLate
+   */
+  @Cron(CronExpression.EVERY_DAY_AT_6AM, { name: 'assess-penalties' })
+  async handlePenaltyAssessment(): Promise<void> {
+    const taskName = 'assess-penalties';
+    const startTime = Date.now();
+
+    this.logger.log(`Starting task: ${taskName}`);
+
+    const result = await this.lockService.withLock(
+      taskName,
+      async () => {
+        return await this.executeWithRetry(async () => {
+          return await this.penaltyAssessmentJob.assessPenalties();
+        }, taskName);
+      },
+      600, // 10 minutes lock TTL
+    );
+
+    const duration = Date.now() - startTime;
+
+    if (result) {
+      this.logger.log(
+        `Task ${taskName} completed successfully in ${duration}ms. Processed ${result.groupsProcessed} groups, assessed ${result.totalPenalties} penalties.`,
       );
     } else {
       this.logger.warn(`Task ${taskName} was skipped (lock not acquired)`);

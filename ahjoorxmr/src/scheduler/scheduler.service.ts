@@ -9,6 +9,7 @@ import { ContributionSummaryService } from './services/contribution-summary.serv
 import { GroupStatusService } from './services/group-status.service';
 import { StaleGroupDetectionService } from './services/stale-group-detection.service';
 import { RoundAdvanceService } from './services/round-advance.service';
+import { ProfileIncompleteReminderService } from './services/profile-incomplete-reminder.service';
 import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { GroupInviteService } from '../groups/invites/group-invite.service';
 
@@ -25,11 +26,12 @@ export class SchedulerService {
     private readonly groupStatusService: GroupStatusService,
     private readonly staleGroupDetectionService: StaleGroupDetectionService,
     private readonly roundAdvanceService: RoundAdvanceService,
+    private readonly profileIncompleteReminderService: ProfileIncompleteReminderService,
     private readonly configService: ConfigService,
     private readonly groupInviteService: GroupInviteService,
     @InjectRepository(RefreshToken)
     private readonly refreshTokenRepository: Repository<RefreshToken>,
-  ) {}
+  ) { }
 
   /**
    * Daily task: Archive old audit logs (runs at 2 AM)
@@ -270,9 +272,42 @@ export class SchedulerService {
   }
 
   /**
+   * Daily task: Send profile incomplete reminders (runs at 5 AM)
+   * Sends reminder emails to users whose profile completeness score is below 60%
+   * exactly 24 hours after registration.
+   */
+  @Cron(CronExpression.EVERY_DAY_AT_5AM, { name: 'send-profile-incomplete-reminders' })
+  async handleProfileIncompleteReminders(): Promise<void> {
+    const taskName = 'send-profile-incomplete-reminders';
+    const startTime = Date.now();
+
+    this.logger.log(`Starting task: ${taskName}`);
+
+    const result = await this.lockService.withLock(
+      taskName,
+      async () => {
+        return await this.executeWithRetry(async () => {
+          return await this.profileIncompleteReminderService.sendProfileIncompleteReminders();
+        }, taskName);
+      },
+      600, // 10 minutes lock TTL
+    );
+
+    const duration = Date.now() - startTime;
+
+    if (result) {
+      this.logger.log(
+        `Task ${taskName} completed successfully in ${duration}ms. Sent ${result.sentCount} reminders.`,
+      );
+    } else {
+      this.logger.warn(`Task ${taskName} was skipped (lock not acquired)`);
+    }
+  }
+
+  /**
    * Execute a task with exponential backoff retry logic
    */
-  private async executeWithRetry<T>(    fn: () => Promise<T>,
+  private async executeWithRetry<T>(fn: () => Promise<T>,
     taskName: string,
   ): Promise<T> {
     let lastError: Error | undefined;

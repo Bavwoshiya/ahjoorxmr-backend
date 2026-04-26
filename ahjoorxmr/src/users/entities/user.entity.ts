@@ -18,4 +18,17 @@ export class User extends BaseEntity {
 
   @Column({ type: 'varchar', length: 255, nullable: true })
   refreshTokenHash: string | null;
+
+  // ─── 2FA ──────────────────────────────────────────────────────────────────
+
+  @Column({ type: 'boolean', default: false })
+  twoFaEnabled: boolean;
+
+  /** bcrypt-hashed backup recovery codes */
+  @Column({ type: 'simple-array', nullable: true })
+  twoFaBackupCodes: string[] | null;
+
+  /** Set to true once all backup codes have been consumed */
+  @Column({ type: 'boolean', default: false })
+  twoFaBackupCodesExhausted: boolean;
 }

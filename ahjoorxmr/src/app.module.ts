@@ -9,6 +9,7 @@ import { UsersModule } from './users/users.module';
 import { MembershipsModule } from './memberships/memberships.module';
 import { ContributionsModule } from './contributions/contributions.module';
 import { KycModule } from './kyc/kyc.module';
+import { TwoFactorModule } from './two-factor/two-factor.module';
 import { Membership } from './memberships/entities/membership.entity';
 import { Group } from './groups/entities/group.entity';
 import { User } from './users/entities/user.entity';
@@ -47,6 +48,7 @@ import { AuditLog } from './kyc/entities/audit-log.entity';
     MembershipsModule,
     ContributionsModule,
     KycModule,
+    TwoFactorModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -2,22 +2,20 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule } from '@nestjs/config';
 import { KycDocument } from './entities/kyc-document.entity';
-import { AuditLog } from './entities/audit-log.entity';
+import { KycService } from './kyc.service';
+import { KycController } from './kyc.controller';
 import { User } from '../users/entities/user.entity';
-import { KycWebhookService } from './kyc-webhook.service';
-import { KycWebhookController } from './kyc-webhook.controller';
-import { KycProviderFactory } from './providers/kyc-provider.factory';
-import { WebhookHmacGuard } from './guards/webhook-hmac.guard';
 import { NotificationsModule } from '../notification/notifications.module';
+import { WinstonLogger } from '../common/logger/winston.logger';
 
 @Module({
   imports: [
-    ConfigModule,
-    TypeOrmModule.forFeature([KycDocument, AuditLog, User]),
+    TypeOrmModule.forFeature([KycDocument, User]),
     NotificationsModule,
+    ConfigModule,
   ],
-  controllers: [KycWebhookController],
-  providers: [KycWebhookService, KycProviderFactory, WebhookHmacGuard],
-  exports: [KycWebhookService],
+  controllers: [KycController],
+  providers: [KycService, WinstonLogger],
+  exports: [KycService],
 })
 export class KycModule {}

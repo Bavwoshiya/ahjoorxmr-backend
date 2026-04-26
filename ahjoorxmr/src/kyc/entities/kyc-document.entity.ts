@@ -1,25 +1,32 @@
-import { Entity, Column, Index } from 'typeorm';
+import { Entity, Column, ManyToOne, JoinColumn, Index } from 'typeorm';
 import { BaseEntity } from '../../common/entities/base.entity';
-import { KycStatus } from '../enums/kyc-status.enum';
-import { KycProvider } from '../enums/kyc-provider.enum';
+import { User } from '../../users/entities/user.entity';
 
 @Entity('kyc_documents')
 @Index(['userId'])
 export class KycDocument extends BaseEntity {
-  @Column({ type: 'uuid' })
-  @Index()
+  @Column('uuid')
   userId: string;
 
-  @Column({ type: 'varchar', length: 20, default: KycStatus.PENDING })
-  status: KycStatus;
+  @ManyToOne(() => User, { onDelete: 'CASCADE' })
+  @JoinColumn({ name: 'userId' })
+  user: User;
 
-  @Column({ type: 'varchar', length: 20 })
-  provider: KycProvider;
+  @Column('varchar', { length: 500 })
+  storageKey: string;
 
-  /** Provider's own reference ID for this verification */
-  @Column({ type: 'varchar', length: 255, nullable: true })
-  providerReferenceId: string | null;
+  @Column('varchar', { length: 500 })
+  url: string;
 
-  @Column({ type: 'jsonb', nullable: true })
-  providerPayload: Record<string, unknown> | null;
+  @Column('varchar', { length: 100 })
+  mimeType: string;
+
+  @Column('int')
+  fileSize: number;
+
+  @Column('varchar', { length: 255 })
+  originalName: string;
+
+  @Column({ type: 'timestamp', default: () => 'CURRENT_TIMESTAMP' })
+  uploadedAt: Date;
 }

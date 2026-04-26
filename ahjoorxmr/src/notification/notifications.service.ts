@@ -5,11 +5,17 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, LessThan } from 'typeorm';
 import { MailerService } from '@nestjs-modules/mailer';
-import { Notification } from './entities/notification.entity';
-import { NotificationType } from './enums/notification-type.enum';
-import { PaginateNotificationsDto, NotifyDto } from './dto/notifications.dto';
+import { Notification } from './notification.entity';
+import { NotificationType } from './notification-type.enum';
+import {
+  PaginateNotificationsDto,
+  NotifyDto,
+  CreateNotificationDto,
+} from './notifications.dto';
+import { UseReadReplica } from '../common/decorators/read-replica.decorator';
+import { RedisService } from '../common/redis/redis.service';
 
 export interface PaginatedResult<T> {
   data: T[];
@@ -33,6 +39,7 @@ export class NotificationsService {
     @InjectRepository(Notification)
     private readonly notificationRepo: Repository<Notification>,
     private readonly mailerService: MailerService,
+    private readonly redisService: RedisService,
   ) {}
 
   /**
@@ -46,32 +53,102 @@ export class NotificationsService {
       title: dto.title,
       body: dto.body,
       metadata: dto.metadata ?? {},
+      idempotencyKey: dto.idempotencyKey ?? null,
     });
 
     const saved = await this.notificationRepo.save(notification);
 
+    // Publish to Redis for SSE consumers
+    this.redisService
+      .getClient()
+      .publish(`notifications:${dto.userId}`, JSON.stringify(saved))
+      .catch((err) => this.logger.error(`Redis publish failed: ${err.message}`));
+
     if (dto.sendEmail && dto.emailTo) {
-      setImmediate(() => this.sendEmail(dto).catch((err) => {
-        this.logger.error(
-          `Failed to send email for notification ${saved.id}: ${err.message}`,
-          err.stack,
-        );
-      }));
+      setImmediate(() =>
+        this.sendEmail(dto).catch((err) => {
+          this.logger.error(
+            `Failed to send email for notification ${saved.id}: ${err.message}`,
+            err.stack,
+          );
+        }),
+      );
     }
 
     return saved;
   }
 
+  /**
+   * Batch insert notifications with idempotency.
+   * Duplicate idempotency keys within 24h are silently dropped.
+   */
+  async notifyBatch(
+    notifications: CreateNotificationDto[],
+  ): Promise<Notification[]> {
+    if (notifications.length === 0) {
+      return [];
+    }
+
+    const uniqueNotifications = this.deduplicateByKey(notifications);
+    const existingKeys = await this.getExistingKeys(
+      uniqueNotifications
+        .map((n) => n.idempotencyKey)
+        .filter(Boolean) as string[],
+    );
+
+    const toInsert = uniqueNotifications.filter(
+      (n) => !n.idempotencyKey || !existingKeys.has(n.idempotencyKey),
+    );
+
+    if (toInsert.length === 0) {
+      this.logger.debug('All notifications were duplicates, skipping insert');
+      return [];
+    }
+
+    const entities = toInsert.map((dto) =>
+      this.notificationRepo.create({
+        userId: dto.userId,
+        type: dto.type,
+        title: dto.title,
+        body: dto.body,
+        metadata: dto.metadata ?? {},
+        idempotencyKey: dto.idempotencyKey ?? null,
+      }),
+    );
+
+    try {
+      const saved = await this.notificationRepo.save(entities);
+      this.logger.log(`Batch inserted ${saved.length} notifications`);
+      return saved;
+    } catch (error) {
+      this.logger.error(`Batch insert failed: ${error.message}`, error.stack);
+      throw error;
+    }
+  }
+
+  @UseReadReplica()
   async findAll(
     userId: string,
     query: PaginateNotificationsDto,
+    cursor?: string,
   ): Promise<PaginatedResult<Notification>> {
     const { page = 1, limit = 20, type } = query;
-    const skip = (page - 1) * limit;
 
     const where: Record<string, any> = { userId };
     if (type) where.type = type;
 
+    // Cursor-based pagination: cursor is the createdAt ISO string of the last seen item
+    if (cursor) {
+      where.createdAt = LessThan(new Date(cursor));
+      const data = await this.notificationRepo.find({
+        where,
+        order: { createdAt: 'DESC' },
+        take: limit,
+      });
+      return { data, total: data.length, page: 1, limit, totalPages: 1 };
+    }
+
+    const skip = (page - 1) * limit;
     const [data, total] = await this.notificationRepo.findAndCount({
       where,
       order: { createdAt: 'DESC' },
@@ -121,6 +198,34 @@ export class NotificationsService {
   }
 
   // ─── Private Helpers ──────────────────────────────────────────────────────
+
+  private deduplicateByKey(
+    notifications: CreateNotificationDto[],
+  ): CreateNotificationDto[] {
+    const seen = new Set<string>();
+    return notifications.filter((n) => {
+      if (!n.idempotencyKey) return true;
+      if (seen.has(n.idempotencyKey)) return false;
+      seen.add(n.idempotencyKey);
+      return true;
+    });
+  }
+
+  private async getExistingKeys(keys: string[]): Promise<Set<string>> {
+    if (keys.length === 0) return new Set();
+
+    const cutoff = new Date();
+    cutoff.setHours(cutoff.getHours() - 24);
+
+    const existing = await this.notificationRepo
+      .createQueryBuilder('n')
+      .select('n.idempotencyKey')
+      .where('n.idempotencyKey IN (:...keys)', { keys })
+      .andWhere('n.createdAt > :cutoff', { cutoff })
+      .getRawMany();
+
+    return new Set(existing.map((row) => row.n_idempotencyKey));
+  }
 
   private async sendEmail(dto: NotifyDto): Promise<void> {
     const template = EMAIL_TEMPLATE_MAP[dto.type];

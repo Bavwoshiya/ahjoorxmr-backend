@@ -1,0 +1,46 @@
+import { Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { GroupsController } from './groups.controller';
+import { GroupsV2Controller } from './groups-v2.controller';
+import { GroupsService } from './groups.service';
+import { RoundService } from './round.service';
+import { PayoutService } from './payout.service';
+import { Group } from './entities/group.entity';
+import { Membership } from '../memberships/entities/membership.entity';
+import { WinstonLogger } from '../common/logger/winston.logger';
+import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { NotificationsModule } from '../notification/notifications.module';
+import { StellarModule } from '../stellar/stellar.module';
+import { PayoutTransaction } from './entities/payout-transaction.entity';
+import { QueueModule } from '../bullmq/queue.module';
+import { GroupInvite } from './entities/group-invite.entity';
+import { GroupInviteService } from './invites/group-invite.service';
+import { GroupInviteController } from './invites/group-invite.controller';
+import { MailModule } from '../mail/mail.module';
+import { User } from '../users/entities/user.entity';
+
+/**
+ * GroupsModule manages ROSCA group entities in the database.
+ * It is the source of truth for group state as reflected by the REST API.
+ * Smart contract interactions are handled by a separate Stellar service.
+ */
+@Module({
+  imports: [
+    TypeOrmModule.forFeature([Group, Membership, PayoutTransaction, GroupInvite, User]),
+    NotificationsModule,
+    StellarModule,
+    QueueModule,
+    MailModule,
+  ],
+  controllers: [GroupsController, GroupsV2Controller, GroupInviteController],
+  providers: [
+    GroupsService,
+    RoundService,
+    PayoutService,
+    WinstonLogger,
+    JwtAuthGuard,
+    GroupInviteService,
+  ],
+  exports: [GroupsService, RoundService, PayoutService, GroupInviteService],
+})
+export class GroupsModule {}

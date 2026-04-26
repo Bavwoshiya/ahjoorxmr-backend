@@ -1,4 +1,17 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Delete,
+  Param,
+  Query,
+  SerializeOptions,
+  UseGuards,
+  Version,
+  Request,
+  HttpCode,
+  HttpStatus,
+} from '@nestjs/common';
 import {
   ApiTags,
   ApiOperation,
@@ -11,15 +24,30 @@ import {
   InternalServerErrorResponseDto,
   ValidationErrorResponseDto,
 } from '../common/dto/error-response.dto';
-
-// Mock guard for demonstration - replace with actual auth guard
-class JwtAuthGuard {}
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { UsersService } from './users.service';
+import { UserResponseDto } from './dto/user-response.dto';
+import { GdprService } from './gdpr.service';
+import { ApiKeysService } from '../api-keys/api-keys.service';
+import { ApiKeyResponseDto } from '../api-keys/dto/api-key.dto';
+import { ProfileCompletenessService } from './services/profile-completeness.service';
+import { ProfileCompletenessDto } from './dtos/profile-completeness.dto';
 
 @ApiTags('Users')
 @Controller('users')
+@UseGuards(JwtAuthGuard, RolesGuard)
 export class UsersController {
+  constructor(
+    private readonly usersService: UsersService,
+    private readonly gdprService: GdprService,
+    private readonly apiKeysService: ApiKeysService,
+    private readonly profileCompletenessService: ProfileCompletenessService,
+  ) { }
   @Get()
-  @UseGuards(JwtAuthGuard)
+  @Version('1')
+  @Roles('admin')
   @ApiBearerAuth('JWT-auth')
   @ApiOperation({
     summary: 'Get paginated list of users',
@@ -123,5 +151,88 @@ export class UsersController {
       limit: query.limit || 10,
       totalPages: Math.ceil(100 / (query.limit || 10)),
     };
+  }
+
+  @Get(':id')
+  @Version('1')
+  @SerializeOptions({ type: UserResponseDto })
+  @ApiOperation({
+    summary: 'Get user profile by ID',
+    description: 'Returns safe public fields for the requested user profile.',
+  })
+  @ApiResponse({ status: 200, type: UserResponseDto })
+  @ApiResponse({ status: 404, description: 'User not found' })
+  async findOne(@Param('id') id: string): Promise<UserResponseDto> {
+    const user = await this.usersService.findById(id);
+    return new UserResponseDto(user);
+  }
+
+  @Get('me/api-keys')
+  @Version('1')
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({ summary: 'List own API keys' })
+  @ApiResponse({ status: 200, type: [ApiKeyResponseDto] })
+  async getMyApiKeys(
+    @Request() req: { user: { id: string } },
+  ): Promise<ApiKeyResponseDto[]> {
+    const keys = await this.apiKeysService.findAllForUser(req.user.id);
+    return keys.map((k) => ({
+      id: k.id,
+      name: k.name,
+      ownerId: k.ownerId,
+      scopes: k.scopes,
+      lastUsedAt: k.lastUsedAt,
+      expiresAt: k.expiresAt,
+      revokedAt: k.revokedAt,
+      createdAt: k.createdAt,
+    }));
+  }
+
+  @Get('me/profile')
+  @Version('1')
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({
+    summary: 'Get profile completeness score',
+    description: 'Returns profile completeness score (0-100) with completed and pending steps.',
+  })
+  @ApiResponse({ status: 200, type: ProfileCompletenessDto })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getProfileCompleteness(
+    @Request() req: { user: { id: string } },
+  ): Promise<ProfileCompletenessDto> {
+    return this.profileCompletenessService.calculateProfileCompleteness(req.user.id);
+  }
+
+  @Post('me/data-export')
+  @Version('1')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({
+    summary: 'Request GDPR data export',
+    description: 'Queues a job to collect all user data and email a presigned S3 download link.',
+  })
+  @ApiResponse({ status: 202, description: 'Export job queued' })
+  async requestDataExport(
+    @Request() req: { user: { id: string }; ip: string },
+  ): Promise<{ message: string }> {
+    await this.gdprService.requestDataExport(req.user.id, req.ip);
+    return { message: 'Data export queued. You will receive an email with the download link.' };
+  }
+
+  @Delete('me')
+  @Version('1')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({
+    summary: 'Request account erasure (GDPR Art. 17)',
+    description: 'Anonymizes PII and hard-deletes KYC records. 30-day cooldown enforced.',
+  })
+  @ApiResponse({ status: 202, description: 'Erasure job queued' })
+  @ApiResponse({ status: 429, description: 'Erasure request already submitted within 30 days' })
+  async requestErasure(
+    @Request() req: { user: { id: string }; ip: string },
+  ): Promise<{ message: string }> {
+    await this.gdprService.requestErasure(req.user.id, req.ip);
+    return { message: 'Erasure request queued. Your account will be anonymized shortly.' };
   }
 }

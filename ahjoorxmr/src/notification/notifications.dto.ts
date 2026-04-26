@@ -1,6 +1,6 @@
 import { IsEnum, IsInt, IsOptional, Min, Max } from 'class-validator';
 import { Type } from 'class-transformer';
-import { NotificationType } from '../enums/notification-type.enum';
+import { NotificationType } from './notification-type.enum';
 
 export class PaginateNotificationsDto {
   @IsOptional()
@@ -30,4 +30,14 @@ export class NotifyDto {
   sendEmail?: boolean;
   emailTo?: string;
   emailTemplateData?: Record<string, any>;
+  idempotencyKey?: string;
+}
+
+export class CreateNotificationDto {
+  userId: string;
+  type: NotificationType;
+  title: string;
+  body: string;
+  metadata?: Record<string, any>;
+  idempotencyKey?: string;
 }

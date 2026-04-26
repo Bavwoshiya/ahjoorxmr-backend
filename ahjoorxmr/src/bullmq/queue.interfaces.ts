@@ -15,6 +15,8 @@ export interface SendEmailJobData {
 export interface SendNotificationEmailJobData extends SendEmailJobData {
   userId: string;
   notificationType: string;
+  body: string;
+  actionLink?: string;
 }
 
 export interface SendWelcomeEmailJobData {
@@ -69,6 +71,10 @@ export interface SyncGroupStateJobData {
 export interface SyncAllGroupsJobData {
   chainId: number;
   batchSize?: number;
+}
+
+export interface ReconcilePayoutJobData {
+  payoutTransactionId: string;
 }
 
 // ---------------------------------------------------------------------------

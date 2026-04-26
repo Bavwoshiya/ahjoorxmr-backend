@@ -18,6 +18,7 @@ import { User } from '../../users/entities/user.entity';
  */
 @Entity('contributions')
 @Unique(['transactionHash'])
+@Unique(['userId', 'groupId', 'roundNumber'])
 export class Contribution {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -53,6 +54,14 @@ export class Contribution {
 
   @Column('timestamp')
   timestamp: Date;
+
+  /** Asset code used for this contribution (e.g. 'XLM', 'USDC'). Copied from group at contribution time. */
+  @Column({ type: 'varchar', length: 12, default: 'XLM' })
+  assetCode: string;
+
+  /** Stellar issuer account for the asset. Null for native XLM. */
+  @Column({ type: 'varchar', length: 56, nullable: true, default: null })
+  assetIssuer: string | null;
 
   @CreateDateColumn()
   createdAt: Date;

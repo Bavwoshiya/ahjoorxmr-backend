@@ -30,8 +30,8 @@ export class Membership extends BaseEntity {
   @Column('varchar', { length: 255 })
   walletAddress: string;
 
-  @Column('int')
-  payoutOrder: number;
+  @Column('int', { nullable: true })
+  payoutOrder: number | null;
 
   @Column('boolean', { default: false })
   hasReceivedPayout: boolean;
@@ -39,11 +39,16 @@ export class Membership extends BaseEntity {
   @Column('boolean', { default: false })
   hasPaidCurrentRound: boolean;
 
-  // Note: Using varchar instead of enum for SQLite compatibility
-  // For PostgreSQL, you can use: type: 'enum', enum: MembershipStatus
+  @Column('int', { default: 0 })
+  contributionsMade: number;
+
+  @Column('varchar', { length: 255, nullable: true })
+  transactionHash: string | null;
+
+  // Using PostgreSQL ENUM type for better type safety and performance
   @Column({
-    type: 'varchar',
-    length: 20,
+    type: 'enum',
+    enum: MembershipStatus,
     default: MembershipStatus.ACTIVE,
   })
   status: MembershipStatus;

@@ -14,9 +14,16 @@ import { WinstonLogger } from '../common/logger/winston.logger';
 import { CreateGroupDto } from './dto/create-group.dto';
 import { UpdateGroupDto } from './dto/update-group.dto';
 import { GroupStatus } from './entities/group-status.enum';
+import { PayoutOrderStrategy } from './entities/payout-order-strategy.enum';
 import { NotificationsService } from '../notification/notifications.service';
 import { NotificationType } from '../notification/notification-type.enum';
 import { StellarService } from '../stellar/stellar.service';
+import { TransferAdminDto } from './dto/transfer-admin.dto';
+import { MembershipStatus } from '../memberships/entities/membership-status.enum';
+import { AuditService } from '../audit/audit.service';
+import { WebhookService, WebhookEventType } from '../webhooks/webhook.service';
+import { GroupActivatedPayload, GroupArchivedPayload } from '../webhooks/interfaces/webhook.interface';
+import { GroupTemplatesService } from './group-templates.service';
 
 import { UseReadReplica } from '../common/decorators/read-replica.decorator';
 
@@ -36,21 +43,27 @@ export class GroupsService {
     private readonly notificationsService: NotificationsService,
     private readonly stellarService: StellarService,
     private readonly configService: ConfigService,
+    private readonly auditService: AuditService,
+    private readonly webhookService: WebhookService,
     @InjectDataSource()
     private readonly dataSource: DataSource,
+    private readonly groupTemplatesService: GroupTemplatesService,
   ) {}
 
   /**
    * Creates a new ROSCA group with status PENDING.
    * The adminWallet is taken from the authenticated user's wallet (passed in, not from DTO).
+   * If templateId is provided, template config is merged as defaults (explicit DTO fields override template values).
    *
    * @param createGroupDto - Group creation data
    * @param adminWallet - Wallet address of the authenticated admin user
+   * @param userId - UUID of the authenticated user (needed for template visibility check)
    * @returns The created Group entity
    */
   async createGroup(
     createGroupDto: CreateGroupDto,
     adminWallet: string,
+    userId?: string,
   ): Promise<Group> {
     this.logger.log(
       `Creating group "${createGroupDto.name}" for admin ${adminWallet}`,
@@ -58,21 +71,32 @@ export class GroupsService {
     );
 
     try {
-      const maxMembers =
-        createGroupDto.maxMembers ?? createGroupDto.totalRounds;
+      let finalDto = { ...createGroupDto };
 
-      if (maxMembers !== createGroupDto.totalRounds) {
+      // If templateId is provided, merge template config as defaults
+      if (createGroupDto.templateId && userId) {
+        const template = await this.groupTemplatesService.findTemplateById(
+          createGroupDto.templateId,
+          userId,
+        );
+        finalDto = this.groupTemplatesService.mergeTemplateConfig(template, finalDto);
+      }
+
+      const maxMembers =
+        finalDto.maxMembers ?? finalDto.totalRounds;
+
+      if (maxMembers !== finalDto.totalRounds) {
         throw new BadRequestException('maxMembers must equal totalRounds');
       }
 
-      if (createGroupDto.minMembers > maxMembers) {
+      if (finalDto.minMembers > maxMembers) {
         throw new BadRequestException(
           'minMembers must be less than or equal to maxMembers',
         );
       }
 
       // Validate asset code against allow-list
-      const assetCode = createGroupDto.assetCode ?? 'XLM';
+      const assetCode = finalDto.assetCode ?? 'XLM';
       const allowedRaw = this.configService.get<string>('ALLOWED_ASSET_CODES', 'XLM,USDC');
       const allowedCodes = allowedRaw.split(',').map((c) => c.trim().toUpperCase());
       if (!allowedCodes.includes(assetCode.toUpperCase())) {
@@ -81,20 +105,32 @@ export class GroupsService {
         );
       }
 
-      const assetIssuer = assetCode.toUpperCase() === 'XLM' ? null : (createGroupDto.assetIssuer ?? null);
+      const assetIssuer = assetCode.toUpperCase() === 'XLM' ? null : (finalDto.assetIssuer ?? null);
 
       const group = this.groupRepository.create({
-        ...createGroupDto,
+        ...finalDto,
         maxMembers,
         adminWallet,
         status: GroupStatus.PENDING,
         currentRound: 0,
-        contractAddress: createGroupDto.contractAddress ?? null,
+        contractAddress: finalDto.contractAddress ?? null,
         assetCode: assetCode.toUpperCase(),
         assetIssuer,
+        payoutOrderStrategy: finalDto.payoutOrderStrategy
+          ? (finalDto.payoutOrderStrategy as PayoutOrderStrategy)
+          : PayoutOrderStrategy.SEQUENTIAL,
+        penaltyRate: finalDto.penaltyRate ?? 0.05,
+        gracePeriodHours: finalDto.gracePeriodHours ?? 24,
       });
 
       const savedGroup = await this.groupRepository.save(group);
+
+      // Atomically increment template usage count if template was used
+      if (createGroupDto.templateId) {
+        await this.groupTemplatesService.incrementUsageCount(
+          createGroupDto.templateId,
+        );
+      }
 
       this.logger.log(
         `Group created with id ${savedGroup.id} for admin ${adminWallet}`,
@@ -349,6 +385,22 @@ export class GroupsService {
     await this.groupRepository.softDelete(id);
 
     this.logger.log(`Group ${id} soft-deleted successfully`, 'GroupsService');
+
+    // Dispatch GROUP_ARCHIVED webhook event
+    try {
+      const payload: GroupArchivedPayload = {
+        groupId: id,
+        archivedAt: new Date().toISOString(),
+      };
+      await this.webhookService.dispatchEvent(WebhookEventType.GROUP_ARCHIVED, payload);
+      this.logger.log(`Dispatched GROUP_ARCHIVED webhook for group ${id}`, 'GroupsService');
+    } catch (webhookError) {
+      this.logger.error(
+        `Failed to dispatch GROUP_ARCHIVED webhook for group ${id}: ${(webhookError as Error).message}`,
+        (webhookError as Error).stack,
+        'GroupsService',
+      );
+    }
   }
 
   /**
@@ -402,13 +454,44 @@ export class GroupsService {
       }
 
       // 4. Check group.members.length >= group.minMembers
-      const memberCount = group.memberships?.length || 0;
+      const members = group.memberships || [];
+      const memberCount = members.length;
       if (memberCount < group.minMembers) {
         this.logger.warn(
           `Group ${groupId} has ${memberCount} members but requires ${group.minMembers}`,
           'GroupsService',
         );
         throw new BadRequestException('Group does not have enough members');
+      }
+
+      // Handle Payout Order Strategy
+      if (group.payoutOrderStrategy === PayoutOrderStrategy.RANDOM) {
+        const indices = Array.from({ length: memberCount }, (_, i) => i);
+        for (let i = indices.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [indices[i], indices[j]] = [indices[j], indices[i]];
+        }
+        for (let i = 0; i < members.length; i++) {
+          members[i].payoutOrder = indices[i];
+          await this.membershipRepository.save(members[i]);
+        }
+      } else if (
+        group.payoutOrderStrategy === PayoutOrderStrategy.ADMIN_DEFINED
+      ) {
+        const orders = members.map((m) => m.payoutOrder);
+        if (orders.some((o) => o === null || o === undefined)) {
+          throw new BadRequestException(
+            'All members must have a payout order for ADMIN_DEFINED strategy',
+          );
+        }
+        const sortedOrders = [...orders].sort((a, b) => a! - b!);
+        for (let i = 0; i < memberCount; i++) {
+          if (sortedOrders[i] !== i) {
+            throw new BadRequestException(
+              'Payout orders must be a continuous sequence starting from 0',
+            );
+          }
+        }
       }
 
       // 5. Set group.status = ACTIVE
@@ -432,6 +515,25 @@ export class GroupsService {
           `Group ${groupId} activated and contract deployed at ${contractAddress}`,
           'GroupsService',
         );
+
+        // Dispatch GROUP_ACTIVATED webhook event
+        try {
+          const members = group.memberships || [];
+          const payload: GroupActivatedPayload = {
+            groupId,
+            activatedAt: new Date().toISOString(),
+            totalRounds: group.totalRounds,
+            memberCount: members.length,
+          };
+          await this.webhookService.dispatchEvent(WebhookEventType.GROUP_ACTIVATED, payload);
+          this.logger.log(`Dispatched GROUP_ACTIVATED webhook for group ${groupId}`, 'GroupsService');
+        } catch (webhookError) {
+          this.logger.error(
+            `Failed to dispatch GROUP_ACTIVATED webhook for group ${groupId}: ${(webhookError as Error).message}`,
+            (webhookError as Error).stack,
+            'GroupsService',
+          );
+        }
       } catch (deployError) {
         savedGroup.status = GroupStatus.PENDING;
         savedGroup.currentRound = 0;
@@ -449,7 +551,7 @@ export class GroupsService {
       }
 
       return savedGroup;
-    } catch (error) {
+    } catch (error: any) {
       if (
         error instanceof NotFoundException ||
         error instanceof ForbiddenException ||
@@ -464,6 +566,107 @@ export class GroupsService {
       );
       throw error;
     }
+  }
+
+  /**
+   * Transfers group admin ownership to another active member.
+   *
+   * @param groupId - The UUID of the group
+   * @param adminWallet - Wallet address of the current admin
+   * @param transferAdminDto - Data containing the new admin user ID
+   * @returns The updated Group entity
+   */
+  async transferAdmin(
+    groupId: string,
+    adminWallet: string,
+    transferAdminDto: TransferAdminDto,
+  ): Promise<Group> {
+    const { newAdminUserId } = transferAdminDto;
+
+    const group = await this.groupRepository.findOne({
+      where: { id: groupId },
+    });
+
+    if (!group) {
+      throw new NotFoundException('Group not found');
+    }
+
+    if (group.adminWallet !== adminWallet) {
+      throw new ForbiddenException('Only the current admin can transfer ownership');
+    }
+
+    // Verify the target user has an ACTIVE membership in the group
+    const newAdminMembership = await this.membershipRepository.findOne({
+      where: {
+        groupId,
+        userId: newAdminUserId,
+        status: MembershipStatus.ACTIVE,
+      },
+    });
+
+    if (!newAdminMembership) {
+      throw new BadRequestException(
+        'Target user must be an active member of the group',
+      );
+    }
+
+    const oldAdminWallet = group.adminWallet;
+    const newAdminWallet = newAdminMembership.walletAddress;
+
+    // Update atomically
+    group.adminWallet = newAdminWallet;
+    const savedGroup = await this.groupRepository.save(group);
+
+    // Emit audit log
+    await this.auditService.createLog({
+      userId: group.id, // Or use the requester's ID if available
+      action: 'GROUP_ADMIN_TRANSFER',
+      resource: 'Group',
+      metadata: {
+        groupId,
+        oldAdminWallet,
+        newAdminWallet,
+        newAdminUserId,
+      },
+    });
+
+    // Send notifications to both old and new admin
+    const notifications = [
+      {
+        userId: newAdminUserId,
+        type: NotificationType.ADMIN_TRANSFERRED,
+        title: 'Group Admin Ownership Transferred',
+        body: `You are now the admin of group "${group.name}"`,
+        metadata: { groupId, role: 'new_admin' },
+      },
+      // Note: We need to find the user ID for the old admin to notify them
+      // Assuming we can find it via membership or by adding it to the group entity if needed.
+      // For now, let's notify the new admin. If we need to notify the old admin, we should find their userId.
+    ];
+
+    // Attempt to notify old admin if they are still a member
+    const oldAdminMembership = await this.membershipRepository.findOne({
+      where: { groupId, walletAddress: oldAdminWallet },
+    });
+
+    if (oldAdminMembership) {
+      notifications.push({
+        userId: oldAdminMembership.userId,
+        type: NotificationType.ADMIN_TRANSFERRED,
+        title: 'Group Admin Ownership Transferred',
+        body: `You have transferred admin ownership of group "${group.name}" to another member`,
+        metadata: { groupId, role: 'old_admin' },
+      });
+    }
+
+    await this.notificationsService.notifyBatch(notifications);
+
+    this.logger.log(
+      `Admin ownership of group ${groupId} transferred from ${oldAdminWallet} to ${newAdminWallet}`,
+      'GroupsService',
+    );
+
+    return savedGroup;
   }
 
   /**

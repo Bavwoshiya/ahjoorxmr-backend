@@ -53,6 +53,9 @@ import { WebhookModule } from './webhooks/webhook.module';
 import { AdminModule } from './admin/admin.module';
 import { PenaltiesModule } from './penalties/penalties.module';
 import { Penalty } from './penalties/entities/penalty.entity';
+import { NotificationPreference } from './notification/notification-preference.entity';
+import { WaitlistModule } from './waitlist/waitlist.module';
+import { GroupWaitlist } from './waitlist/entities/group-waitlist.entity';
 
 @Module({
   imports: [
@@ -89,6 +92,8 @@ import { Penalty } from './penalties/entities/penalty.entity';
             ApiKey,
             GroupInvite,
             Penalty,
+            NotificationPreference,
+            GroupWaitlist,
           ],
           synchronize: isDevelopment, // Auto-create tables only in development
           logging: isDevelopment, // Enable logging only in development
@@ -136,6 +141,7 @@ import { Penalty } from './penalties/entities/penalty.entity';
     WebhookModule,
     AdminModule,
     PenaltiesModule,
+    WaitlistModule,
   ],
   controllers: [AppController],
   providers: [

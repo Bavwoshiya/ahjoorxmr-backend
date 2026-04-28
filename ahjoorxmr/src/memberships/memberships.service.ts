@@ -3,6 +3,7 @@ import {
   NotFoundException,
   BadRequestException,
   ConflictException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, QueryFailedError } from 'typeorm';
@@ -15,6 +16,7 @@ import { MembershipStatus } from './entities/membership-status.enum';
 import { NotificationsService } from '../notification/notifications.service';
 import { NotificationType } from '../notification/notification-type.enum';
 import { GroupStatus } from '../groups/entities/group-status.enum';
+import { WaitlistService } from '../waitlist/waitlist.service';
 
 /**
  * Service responsible for managing membership operations in ROSCA groups.
@@ -29,6 +31,7 @@ export class MembershipsService {
     private readonly groupRepository: Repository<Group>,
     private readonly logger: WinstonLogger,
     private readonly notificationsService: NotificationsService,
+    private readonly waitlistService: WaitlistService,
   ) {}
 
   /**
@@ -265,6 +268,17 @@ export class MembershipsService {
         `Member ${userId} removed from group ${groupId} with membership id ${membership.id}`,
         'MembershipsService',
       );
+
+      // Admit next waitlisted user if one exists
+      setImmediate(() =>
+        this.waitlistService.admitNextFromWaitlist(groupId).catch((err) =>
+          this.logger.error(
+            `Failed to admit from waitlist after removal in group ${groupId}: ${err.message}`,
+            err.stack,
+            'MembershipsService',
+          ),
+        ),
+      );
     } catch (error) {
       // Re-throw known exceptions
       if (
@@ -383,6 +397,17 @@ export class MembershipsService {
 
       // Delete membership from database
       await this.membershipRepository.remove(membership);
+
+      // Admit next waitlisted user if one exists
+      setImmediate(() =>
+        this.waitlistService.admitNextFromWaitlist(groupId).catch((err) =>
+          this.logger.error(
+            `Failed to admit from waitlist after leave in group ${groupId}: ${err.message}`,
+            err.stack,
+            'MembershipsService',
+          ),
+        ),
+      );
 
       // Re-sequence payoutOrder for remaining members
       const remainingMembers = await this.membershipRepository.find({
@@ -551,5 +576,125 @@ export class MembershipsService {
     );
 
     return savedMembership;
+  }
+
+  /**
+   * Suspends a member from a group.
+   * Only the group admin (identified by adminWallet) can suspend members.
+   * An admin cannot suspend themselves.
+   *
+   * @param groupId - The UUID of the group
+   * @param targetUserId - The UUID of the member to suspend
+   * @param requestingUserId - The UUID of the requesting user (must be group admin)
+   * @param reason - The reason for suspension
+   * @returns The updated Membership entity
+   */
+  async suspendMember(
+    groupId: string,
+    targetUserId: string,
+    requestingUserId: string,
+    reason: string,
+  ): Promise<Membership> {
+    if (targetUserId === requestingUserId) {
+      throw new ForbiddenException('Group admin cannot suspend themselves');
+    }
+
+    const group = await this.groupRepository.findOne({ where: { id: groupId } });
+    if (!group) throw new NotFoundException('Group not found');
+
+    const requestingMembership = await this.membershipRepository.findOne({
+      where: { groupId, userId: requestingUserId },
+    });
+    if (!requestingMembership) throw new ForbiddenException('Not a group member');
+    if (group.adminWallet !== requestingMembership.walletAddress) {
+      throw new ForbiddenException('Only the group admin can suspend members');
+    }
+
+    const targetMembership = await this.membershipRepository.findOne({
+      where: { groupId, userId: targetUserId },
+    });
+    if (!targetMembership) throw new NotFoundException('Membership not found');
+
+    if (targetMembership.status === MembershipStatus.SUSPENDED) {
+      return targetMembership;
+    }
+
+    targetMembership.status = MembershipStatus.SUSPENDED;
+    const saved = await this.membershipRepository.save(targetMembership);
+
+    await this.notificationsService.notify({
+      userId: targetUserId,
+      type: NotificationType.MEMBER_SUSPENDED,
+      title: 'Your membership has been suspended',
+      body: `Your membership in group "${group.name}" has been suspended. Reason: ${reason}`,
+      metadata: { groupId, reason, adminId: requestingUserId },
+    });
+
+    // A suspended member frees a slot — admit next from waitlist
+    setImmediate(() =>
+      this.waitlistService.admitNextFromWaitlist(groupId).catch((err) =>
+        this.logger.error(
+          `Failed to admit from waitlist after suspension in group ${groupId}: ${err.message}`,
+          err.stack,
+          'MembershipsService',
+        ),
+      ),
+    );
+
+    this.logger.log(
+      `Member ${targetUserId} suspended in group ${groupId} by ${requestingUserId}`,
+      'MembershipsService',
+    );
+
+    return saved;
+  }
+
+  /**
+   * Reinstates a previously suspended member.
+   * Only the group admin can reinstate members.
+   *
+   * @param groupId - The UUID of the group
+   * @param targetUserId - The UUID of the member to reinstate
+   * @param requestingUserId - The UUID of the requesting user (must be group admin)
+   * @returns The updated Membership entity
+   */
+  async reinstateMember(
+    groupId: string,
+    targetUserId: string,
+    requestingUserId: string,
+  ): Promise<Membership> {
+    const group = await this.groupRepository.findOne({ where: { id: groupId } });
+    if (!group) throw new NotFoundException('Group not found');
+
+    const requestingMembership = await this.membershipRepository.findOne({
+      where: { groupId, userId: requestingUserId },
+    });
+    if (!requestingMembership) throw new ForbiddenException('Not a group member');
+    if (group.adminWallet !== requestingMembership.walletAddress) {
+      throw new ForbiddenException('Only the group admin can reinstate members');
+    }
+
+    const targetMembership = await this.membershipRepository.findOne({
+      where: { groupId, userId: targetUserId },
+    });
+    if (!targetMembership) throw new NotFoundException('Membership not found');
+
+    targetMembership.status = MembershipStatus.ACTIVE;
+    const saved = await this.membershipRepository.save(targetMembership);
+
+    await this.notificationsService.notify({
+      userId: targetUserId,
+      type: NotificationType.MEMBER_REINSTATED,
+      title: 'Your membership has been reinstated',
+      body: `Your membership in group "${group.name}" has been reinstated.`,
+      metadata: { groupId, adminId: requestingUserId },
+    });
+
+    this.logger.log(
+      `Member ${targetUserId} reinstated in group ${groupId} by ${requestingUserId}`,
+      'MembershipsService',
+    );
+
+    return saved;
   }
 }

@@ -8,11 +8,13 @@ import { Group } from '../groups/entities/group.entity';
 import { Membership } from '../memberships/entities/membership.entity';
 import { Contribution } from '../contributions/entities/contribution.entity';
 import { NotificationsModule } from '../notification/notifications.module';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
     imports: [
         TypeOrmModule.forFeature([Penalty, Group, Membership, Contribution]),
         NotificationsModule,
+        AuditModule,
     ],
     controllers: [PenaltiesController],
     providers: [PenaltyService, PenaltyAssessmentJob],

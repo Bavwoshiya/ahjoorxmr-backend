@@ -52,10 +52,11 @@ function formatSimulationError(r: unknown): string {
 
 @Injectable()
 export class StellarService {
-  private readonly rpcUrl: string;
+  private readonly rpcUrls: string[];
+  private currentRpcIndex = 0;
   private readonly networkPassphrase: string;
   private readonly defaultContractAddress: string;
-  private readonly server: any;
+  private server: any;
 
   constructor(
     private readonly configService: ConfigService,
@@ -65,7 +66,9 @@ export class StellarService {
     @Inject(forwardRef(() => MetricsService))
     private readonly metricsService: MetricsService,
   ) {
-    this.rpcUrl = this.configService.get<string>('STELLAR_RPC_URL') ?? '';
+    const rawRpcUrls = this.configService.get<string>('STELLAR_RPC_URLS') || this.configService.get<string>('STELLAR_RPC_URL') || '';
+    this.rpcUrls = rawRpcUrls.split(',').map(url => url.trim()).filter(url => url.length > 0);
+    
     this.defaultContractAddress =
       this.configService.get<string>('CONTRACT_ADDRESS') ?? '';
 
@@ -83,9 +86,62 @@ export class StellarService {
         defaultPassphrase,
       ) ?? defaultPassphrase;
 
-    this.server = new (SorobanRpc as any).Server(this.rpcUrl, {
-      allowHttp: this.rpcUrl.startsWith('http://'),
+    this.initializeServer();
+  }
+
+  private initializeServer(): void {
+    const rpcUrl = this.rpcUrls[this.currentRpcIndex];
+    if (!rpcUrl) {
+      this.logger.error('No Stellar RPC URLs available for initialization', 'StellarService');
+      return;
+    }
+    this.server = new (SorobanRpc as any).Server(rpcUrl, {
+      allowHttp: rpcUrl.startsWith('http://'),
     });
+  }
+
+  /**
+   * Helper to execute an RPC call with failover logic.
+   */
+  private async withFailover<T>(
+    operation: (server: any) => Promise<T>,
+    context: string,
+  ): Promise<T> {
+    let lastError: any;
+    const initialRpcIndex = this.currentRpcIndex;
+
+    for (let i = 0; i < this.rpcUrls.length; i++) {
+      const attemptIndex = (initialRpcIndex + i) % this.rpcUrls.length;
+      
+      // If we've already tried some and now switching
+      if (attemptIndex !== this.currentRpcIndex) {
+        this.currentRpcIndex = attemptIndex;
+        this.initializeServer();
+        this.logger.warn(
+          `Retrying ${context} with fallback RPC: ${this.rpcUrls[this.currentRpcIndex]}`,
+          'StellarService'
+        );
+      }
+
+      try {
+        return await operation(this.server);
+      } catch (error) {
+        lastError = error;
+        
+        if (this.isTransientRpcFailure(error)) {
+          this.logger.warn(
+            `Transient RPC failure on ${this.rpcUrls[this.currentRpcIndex]} during ${context}: ${error instanceof Error ? error.message : String(error)}`,
+            'StellarService'
+          );
+          continue; // Try next URL
+        }
+        
+        // If not transient, propagate immediately
+        throw error;
+      }
+    }
+
+    throw lastError;
   }
 
   /**
@@ -264,7 +320,10 @@ export class StellarService {
       }
 
       if (typeof this.server.prepareTransaction === 'function') {
-        tx = await this.server.prepareTransaction(tx);
+        tx = await this.withFailover(
+          (s) => s.prepareTransaction(tx),
+          'prepareTransaction',
+        );
       }
 
       let txHashToStore =
@@ -282,7 +341,10 @@ export class StellarService {
         await onBeforeSubmit(txHashToStore);
       }
 
-      const result = await this.server.sendTransaction(tx);
+      const result = await this.withFailover(
+        (s) => s.sendTransaction(tx),
+        'sendTransaction',
+      );
       const txHash: string =
         result?.hash ??
         result?.id ??
@@ -368,7 +430,10 @@ export class StellarService {
 
     this.validateConfiguration();
     try {
-      const transaction = await this.server.getTransaction(txHash);
+      const transaction = await this.withFailover(
+        (s) => s.getTransaction(txHash),
+        'getTransaction',
+      );
       if (!transaction) {
         return false;
       }
@@ -410,7 +475,10 @@ export class StellarService {
 
     this.validateConfiguration();
     try {
-      const transaction = await this.server.getTransaction(txHash);
+      const transaction = await this.withFailover(
+        (s) => s.getTransaction(txHash),
+        'getTransaction',
+      );
       if (!transaction) {
         return false;
       }
@@ -441,7 +509,10 @@ export class StellarService {
     this.validateConfiguration();
 
     try {
-      const transaction = await this.server.getTransaction(txHash);
+      const transaction = await this.withFailover(
+        (s) => s.getTransaction(txHash),
+        'getTransaction',
+      );
       if (!transaction) {
         return 'PENDING';
       }
@@ -473,6 +544,206 @@ export class StellarService {
   }
 
   /**
+   * Retrieves the contribution amount and asset from a transaction.
+   * Parses the transaction envelope to extract the amount parameter from a 'contribute' call.
+   *
+   * @param txHash - The transaction hash to inspect
+   * @returns Object containing amount (as string), assetCode, and assetIssuer (null for XLM)
+   * @throws BadRequestException if transaction hash is missing
+   * @throws BadRequestException if transaction is not a valid contribution call
+   * @throws BadGatewayException if RPC communication fails
+   */
+  async getTransactionAmount(
+    txHash: string,
+  ): Promise<{ amount: string; assetCode: string; assetIssuer: string | null }> {
+    if (!txHash) {
+      throw new BadRequestException('Transaction hash is required');
+    }
+
+    this.validateConfiguration();
+    try {
+      const transaction = await this.withFailover(
+        (s) => s.getTransaction(txHash),
+        'getTransaction',
+      );
+      if (!transaction) {
+        throw new BadRequestException('Transaction not found on-chain');
+      }
+
+      const status = String(
+        transaction.status ?? transaction.txStatus ?? '',
+      ).toLowerCase();
+      if (status && status !== 'success') {
+        throw new BadRequestException(`Transaction status is not success: ${status}`);
+      }
+
+      return this.extractContributionAmount(transaction);
+    } catch (error) {
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      throw this.mapRpcError('Unable to fetch transaction amount', error);
+    }
+  }
+
+  /**
+   * Extracts contribution amount and asset from a transaction envelope.
+   * Looks for 'contribute' function calls and extracts the amount parameter.
+   *
+   * @param transaction - The transaction object from Stellar RPC
+   * @returns Object containing amount, assetCode, and assetIssuer
+   * @throws BadRequestException if unable to extract amount
+   * @private
+   */
+  private extractContributionAmount(
+    transaction: any,
+  ): { amount: string; assetCode: string; assetIssuer: string | null } {
+    // Try direct transaction fields first
+    const directAmount =
+      transaction.amount ??
+      transaction.paymentAmount ??
+      transaction.contributionAmount;
+    if (directAmount && typeof directAmount === 'string') {
+      const assetCode = transaction.assetCode ?? transaction.asset ?? 'XLM';
+      const assetIssuer = transaction.assetIssuer ?? null;
+      return { amount: directAmount, assetCode, assetIssuer };
+    }
+
+    // Parse envelope XDR to extract amount from function arguments
+    const envelopeXdr =
+      transaction.envelopeXdr ??
+      transaction.envelope_xdr ??
+      transaction.envelope;
+    if (!envelopeXdr || typeof envelopeXdr !== 'string') {
+      throw new BadRequestException('Transaction envelope not available');
+    }
+
+    try {
+      const envelope = (StellarSdk as any).xdr.TransactionEnvelope.fromXDR(
+        envelopeXdr,
+        'base64',
+      );
+      const txContainer =
+        (typeof envelope.v1 === 'function' && envelope.v1()?.tx?.()) ||
+        (typeof envelope.tx === 'function' && envelope.tx()) ||
+        null;
+      const operations = txContainer?.operations?.() ?? [];
+
+      for (const operation of operations) {
+        const body = operation.body?.();
+        const invokeOp = body?.invokeHostFunctionOp?.();
+        const hostFunction = invokeOp?.hostFunction?.();
+        const invokeContract = hostFunction?.invokeContract?.();
+
+        if (!invokeContract) {
+          continue;
+        }
+
+        const functionName = this.readFunctionName(invokeContract);
+        if (functionName !== 'contribute') {
+          continue;
+        }
+
+        // Extract amount from function arguments (typically the first argument after function name)
+        const args = invokeContract.args?.() ?? [];
+        // Look for the amount argument - usually an I128 or U128 SCVal
+        for (const arg of args) {
+          const amount = this.readScValAsString(arg);
+          if (amount && !isNaN(Number(amount))) {
+            // Try to determine asset from transaction meta or default to XLM
+            // In Soroban contracts, asset is often passed as a separate argument
+            let assetCode = 'XLM';
+            let assetIssuer: string | null = null;
+
+            // Check for asset in other arguments
+            for (const otherArg of args) {
+              if (otherArg === arg) continue;
+              const assetStr = this.readScValAsString(otherArg);
+              if (assetStr && (assetStr.length <= 12 || assetStr.includes(':'))) {
+                // Could be an asset identifier
+                if (assetStr.includes(':')) {
+                  const [code, issuer] = assetStr.split(':');
+                  assetCode = code;
+                  assetIssuer = issuer;
+                } else if (assetStr !== amount) {
+                  assetCode = assetStr.toUpperCase();
+                }
+              }
+            }
+
+            return { amount, assetCode, assetIssuer };
+          }
+        }
+      }
+    } catch (parseError) {
+      throw new BadRequestException(
+        `Failed to parse transaction envelope: ${parseError instanceof Error ? parseError.message : 'Unknown error'}`
+      );
+    }
+
+    throw new BadRequestException('Could not extract contribution amount from transaction');
+  }
+
+  /**
+   * Reads an SCVal as a string, handling common numeric types.
+   *
+   * @param scVal - The SCVal to read
+   * @returns String representation of the value, or null if not readable
+   * @private
+   */
+  private readScValAsString(scVal: any): string | null {
+    try {
+      // Try i128/u128 (common for amounts in Soroban)
+      if (typeof scVal.i128 === 'function') {
+        const i128 = scVal.i128();
+        const hi = BigInt(i128.hi().toString());
+        const lo = BigInt(i128.lo().toString());
+        const value = (hi << BigInt(64)) + lo;
+        return value.toString();
+      }
+      if (typeof scVal.u128 === 'function') {
+        const u128 = scVal.u128();
+        const hi = BigInt(u128.hi().toString());
+        const lo = BigInt(u128.lo().toString());
+        const value = (hi << BigInt(64)) + lo;
+        return value.toString();
+      }
+      // Try i64/u64
+      if (typeof scVal.i64 === 'function') {
+        return scVal.i64().toString();
+      }
+      if (typeof scVal.u64 === 'function') {
+        return scVal.u64().toString();
+      }
+      // Try i32/u32
+      if (typeof scVal.i32 === 'function') {
+        return scVal.i32().toString();
+      }
+      if (typeof scVal.u32 === 'function') {
+        return scVal.u32().toString();
+      }
+      // Try symbol
+      if (typeof scVal.sym === 'function') {
+        return scVal.sym().toString();
+      }
+      // Try string
+      if (typeof scVal.str === 'function') {
+        return scVal.str().toString();
+      }
+      // Try toString directly
+      if (typeof scVal.toString === 'function') {
+        const str = scVal.toString();
+        if (str && !isNaN(Number(str))) {
+          return str;
+        }
+      }
+    } catch {
+      // Ignore parsing errors
+    }
+    return null;
+  }
+
+  /**
    * Returns the list of Stellar assets an account has trustlines for.
    * Used by the admin endpoint to validate group asset setup.
    */
@@ -483,7 +754,10 @@ export class StellarService {
   > {
     this.validateConfiguration();
     try {
-      const account = await this.server.loadAccount(accountId);
+      const account = await this.withFailover(
+        (s) => s.loadAccount(accountId),
+        'loadAccount',
+      );
       return (account.balances as any[]).map((b: any) => ({
         assetCode: b.asset_type === 'native' ? 'XLM' : b.asset_code,
         assetIssuer: b.asset_type === 'native' ? null : b.asset_issuer,
@@ -508,7 +782,10 @@ export class StellarService {
   async getNativeBalance(accountId: string): Promise<string> {
     this.validateConfiguration();
     try {
-      const account = await this.server.loadAccount(accountId);
+      const account = await this.withFailover(
+        (s) => s.loadAccount(accountId),
+        'loadAccount',
+      );
       const balances = account.balances as any[];
       const nativeBalance = balances.find(
         (b: any) => b.asset_type === 'native',
@@ -555,6 +832,36 @@ export class StellarService {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Health check endpoint for Stellar RPC URLs.
+   */
+  async getRpcHealth(): Promise<Record<string, { status: string; latencyMs?: number; error?: string }>> {
+    const results: Record<string, { status: string; latencyMs?: number; error?: string }> = {};
+
+    await Promise.all(
+      this.rpcUrls.map(async (url) => {
+        const tempServer = new (SorobanRpc as any).Server(url, {
+          allowHttp: url.startsWith('http://'),
+        });
+        const start = Date.now();
+        try {
+          await tempServer.getLatestLedger();
+          results[url] = {
+            status: 'UP',
+            latencyMs: Date.now() - start,
+          };
+        } catch (error) {
+          results[url] = {
+            status: 'DOWN',
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      })
+    );
+
+    return results;
   }
 
   private isTransientRpcFailure(error: unknown): boolean {
@@ -655,8 +962,14 @@ export class StellarService {
       .setTimeout(30)
       .build();
 
-    const preparedTx = await this.server.prepareTransaction(tx);
-    const simulation = await this.server.simulateTransaction(preparedTx);
+    const preparedTx = await this.withFailover(
+      (s) => s.prepareTransaction(tx),
+      'prepareTransaction',
+    );
+    const simulation = await this.withFailover(
+      (s) => s.simulateTransaction(preparedTx),
+      'simulateTransaction',
+    );
 
     if (isSimulateTransactionErrorResponse(simulation)) {
       throw new Error(formatSimulationError(simulation));
@@ -736,7 +1049,10 @@ export class StellarService {
       };
     }
     if (typeof this.server.prepareTransaction === 'function') {
-      tx = await this.server.prepareTransaction(tx);
+      tx = await this.withFailover(
+        (s) => s.prepareTransaction(tx),
+        'prepareTransaction',
+      );
     }
 
     let lastError: unknown;
@@ -744,7 +1060,10 @@ export class StellarService {
       attempts = attempt + 1;
       try {
         const simStart = Date.now();
-        const simulation = await this.server.simulateTransaction(tx);
+        const simulation = await this.withFailover(
+          (s) => s.simulateTransaction(tx),
+          'simulateTransaction',
+        );
         simulationLatencyMs += Date.now() - simStart;
 
         if (isSimulateTransactionErrorResponse(simulation)) {
@@ -1014,9 +1333,9 @@ export class StellarService {
   }
 
   private validateConfiguration(): void {
-    if (!this.rpcUrl) {
+    if (this.rpcUrls.length === 0) {
       throw new InternalServerErrorException(
-        'Missing STELLAR_RPC_URL configuration',
+        'Missing STELLAR_RPC_URLS or STELLAR_RPC_URL configuration',
       );
     }
 

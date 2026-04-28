@@ -8,5 +8,12 @@ export enum NotificationType {
   MEMBER_REMOVED = 'member_removed',
   SYSTEM_ALERT = 'system_alert',
   KYC_SUBMITTED = 'kyc_submitted',
-  PAYOUT_BLOCKED_PENDING_PENALTY = 'payout_blocked_pending_penalty',
+  ADMIN_TRANSFERRED = 'admin_transferred',
+  PENALTY_DISPUTED = 'penalty_disputed',
+  PENALTY_RESOLVED = 'penalty_resolved',
+  MEMBER_SUSPENDED = 'member_suspended',
+  MEMBER_REINSTATED = 'member_reinstated',
+  GROUP_ANNOUNCEMENT = 'group_announcement',
+  IMPERSONATION_REQUEST = 'impersonation_request',
+  WAITLIST_ADMITTED = 'waitlist_admitted',
 }

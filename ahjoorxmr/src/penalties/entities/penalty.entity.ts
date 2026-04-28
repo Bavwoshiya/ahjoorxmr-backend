@@ -15,6 +15,8 @@ export enum PenaltyStatus {
     PENDING = 'PENDING',
     PAID = 'PAID',
     WAIVED = 'WAIVED',
+    DISPUTED = 'DISPUTED',
+    REJECTED = 'REJECTED',
 }
 
 /**
@@ -75,6 +77,24 @@ export class Penalty {
 
     @Column('timestamp', { nullable: true })
     waivedAt?: Date | null;
+
+    @Column('text', { nullable: true })
+    disputeReason?: string | null;
+
+    @Column('varchar', { length: 255, nullable: true })
+    disputeTxHash?: string | null;
+
+    @Column('timestamp', { nullable: true })
+    disputedAt?: Date | null;
+
+    @Column('text', { nullable: true })
+    resolutionNotes?: string | null;
+
+    @Column('uuid', { nullable: true })
+    resolvedByUserId?: string | null;
+
+    @Column('timestamp', { nullable: true })
+    resolvedAt?: Date | null;
 
     @CreateDateColumn()
     createdAt: Date;

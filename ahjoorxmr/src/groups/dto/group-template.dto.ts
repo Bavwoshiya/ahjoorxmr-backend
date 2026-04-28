@@ -152,14 +152,14 @@ export class CreateGroupTemplateDto {
   @IsBoolean()
   isPublic?: boolean;
 
-  @ApiProperty({
-    description: 'Configuration object containing group settings',
+  @ApiPropertyOptional({
+    description: 'Configuration object containing group settings. Required if fromGroupId is not provided.',
     type: GroupTemplateConfigDto,
   })
   @Type(() => GroupTemplateConfigDto)
+  @IsOptional()
   @IsObject()
-  @IsNotEmpty()
-  config: GroupTemplateConfigDto;
+  config?: GroupTemplateConfigDto;
 
   @ApiPropertyOptional({
     description: 'Group ID to clone configuration from (instead of providing config directly)',

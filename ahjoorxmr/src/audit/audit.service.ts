@@ -32,6 +32,8 @@ export class AuditService {
     }
   }
 
+  /**
+   * Find all audit logs with filters and pagination
    * @param query - The filter and pagination data
    * @returns Paginated result
    */

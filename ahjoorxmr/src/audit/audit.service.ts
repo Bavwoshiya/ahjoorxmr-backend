@@ -32,6 +32,8 @@ export class AuditService {
     }
   }
 
+  /**
+   * Find all audit logs with filters and pagination
    * @param query - The filter and pagination data
    * @returns Paginated result
    */
@@ -109,6 +111,17 @@ export class AuditService {
       this.logger.error('Failed to archive old logs', error);
       throw error;
     }
+  }
+
+  /**
+   * Returns the last 100 impersonation events for compliance review.
+   */
+  async findImpersonationLogs(): Promise<AuditLog[]> {
+    return this.auditLogRepository.find({
+      where: { action: 'IMPERSONATION_REQUEST' },
+      order: { timestamp: 'DESC' },
+      take: 100,
+    });
   }
 
   async exportAuditLogs(

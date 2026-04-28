@@ -21,6 +21,7 @@ import { User } from '../users/entities/user.entity';
 import { Announcement } from './entities/announcement.entity';
 import { AnnouncementsService } from './announcements.service';
 import { AnnouncementsController } from './announcements.controller';
+import { AuditModule } from '../audit/audit.module';
 
 /**
  * GroupsModule manages ROSCA group entities in the database.
@@ -34,6 +35,7 @@ import { AnnouncementsController } from './announcements.controller';
     StellarModule,
     QueueModule,
     MailModule,
+    AuditModule,
   ],
   controllers: [GroupsController, GroupsV2Controller, GroupInviteController, AnnouncementsController],
   providers: [

@@ -5,7 +5,6 @@ import {
   Inject,
   Injectable,
   InternalServerErrorException,
-  Inject,
   forwardRef,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -16,6 +15,7 @@ import type { Group } from '../groups/entities/group.entity';
 import { WinstonLogger } from '../common/logger/winston.logger';
 import type { ContractInvocationResult } from './contract-invocation.types';
 import { MetricsService } from '../metrics/metrics.service';
+import { withStellarSpan } from '../common/tracing/stellar-tracing';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -52,10 +52,11 @@ function formatSimulationError(r: unknown): string {
 
 @Injectable()
 export class StellarService {
-  private readonly rpcUrl: string;
+  private readonly rpcUrls: string[];
+  private currentRpcIndex = 0;
   private readonly networkPassphrase: string;
   private readonly defaultContractAddress: string;
-  private readonly server: any;
+  private server: any;
 
   constructor(
     private readonly configService: ConfigService,
@@ -65,7 +66,9 @@ export class StellarService {
     @Inject(forwardRef(() => MetricsService))
     private readonly metricsService: MetricsService,
   ) {
-    this.rpcUrl = this.configService.get<string>('STELLAR_RPC_URL') ?? '';
+    const rawRpcUrls = this.configService.get<string>('STELLAR_RPC_URLS') || this.configService.get<string>('STELLAR_RPC_URL') || '';
+    this.rpcUrls = rawRpcUrls.split(',').map(url => url.trim()).filter(url => url.length > 0);
+    
     this.defaultContractAddress =
       this.configService.get<string>('CONTRACT_ADDRESS') ?? '';
 
@@ -83,9 +86,62 @@ export class StellarService {
         defaultPassphrase,
       ) ?? defaultPassphrase;
 
-    this.server = new (SorobanRpc as any).Server(this.rpcUrl, {
-      allowHttp: this.rpcUrl.startsWith('http://'),
+    this.initializeServer();
+  }
+
+  private initializeServer(): void {
+    const rpcUrl = this.rpcUrls[this.currentRpcIndex];
+    if (!rpcUrl) {
+      this.logger.error('No Stellar RPC URLs available for initialization', 'StellarService');
+      return;
+    }
+    this.server = new (SorobanRpc as any).Server(rpcUrl, {
+      allowHttp: rpcUrl.startsWith('http://'),
     });
+  }
+
+  /**
+   * Helper to execute an RPC call with failover logic.
+   */
+  private async withFailover<T>(
+    operation: (server: any) => Promise<T>,
+    context: string,
+  ): Promise<T> {
+    let lastError: any;
+    const initialRpcIndex = this.currentRpcIndex;
+
+    for (let i = 0; i < this.rpcUrls.length; i++) {
+      const attemptIndex = (initialRpcIndex + i) % this.rpcUrls.length;
+      
+      // If we've already tried some and now switching
+      if (attemptIndex !== this.currentRpcIndex) {
+        this.currentRpcIndex = attemptIndex;
+        this.initializeServer();
+        this.logger.warn(
+          `Retrying ${context} with fallback RPC: ${this.rpcUrls[this.currentRpcIndex]}`,
+          'StellarService'
+        );
+      }
+
+      try {
+        return await operation(this.server);
+      } catch (error) {
+        lastError = error;
+        
+        if (this.isTransientRpcFailure(error)) {
+          this.logger.warn(
+            `Transient RPC failure on ${this.rpcUrls[this.currentRpcIndex]} during ${context}: ${error instanceof Error ? error.message : String(error)}`,
+            'StellarService'
+          );
+          continue; // Try next URL
+        }
+        
+        // If not transient, propagate immediately
+        throw error;
+      }
+    }
+
+    throw lastError;
   }
 
   /**
@@ -112,6 +168,35 @@ export class StellarService {
    * @returns The transaction hash of the submitted payout
    */
   async disbursePayout(
+    contractAddress: string,
+    recipientWallet: string,
+    amount: string,
+    onBeforeSubmit?: (txHash: string) => Promise<void>,
+    assetCode?: string,
+    assetIssuer?: string | null,
+  ): Promise<string> {
+    return withStellarSpan(
+      'stellar.submit_transaction',
+      { network: this.networkPassphrase, contractAddress },
+      async (span) => {
+        span.setAttributes({
+          'stellar.operation': 'disburse_payout',
+          'stellar.recipient': recipientWallet,
+          'stellar.amount': amount,
+        });
+        return this.disbursePayout_impl(
+          contractAddress,
+          recipientWallet,
+          amount,
+          onBeforeSubmit,
+          assetCode,
+          assetIssuer,
+        );
+      },
+    );
+  }
+
+  private async disbursePayout_impl(
     contractAddress: string,
     recipientWallet: string,
     amount: string,
@@ -235,7 +320,10 @@ export class StellarService {
       }
 
       if (typeof this.server.prepareTransaction === 'function') {
-        tx = await this.server.prepareTransaction(tx);
+        tx = await this.withFailover(
+          (s) => s.prepareTransaction(tx),
+          'prepareTransaction',
+        );
       }
 
       let txHashToStore =
@@ -253,7 +341,10 @@ export class StellarService {
         await onBeforeSubmit(txHashToStore);
       }
 
-      const result = await this.server.sendTransaction(tx);
+      const result = await this.withFailover(
+        (s) => s.sendTransaction(tx),
+        'sendTransaction',
+      );
       const txHash: string =
         result?.hash ??
         result?.id ??
@@ -322,13 +413,27 @@ export class StellarService {
   }
 
   async verifyContribution(txHash: string): Promise<boolean> {
+    return withStellarSpan(
+      'stellar.get_transaction',
+      { network: this.networkPassphrase },
+      async (span) => {
+        span.setAttribute('stellar.tx_hash', txHash);
+        return this.verifyContribution_impl(txHash);
+      },
+    );
+  }
+
+  private async verifyContribution_impl(txHash: string): Promise<boolean> {
     if (!txHash) {
       throw new BadRequestException('Transaction hash is required');
     }
 
     this.validateConfiguration();
     try {
-      const transaction = await this.server.getTransaction(txHash);
+      const transaction = await this.withFailover(
+        (s) => s.getTransaction(txHash),
+        'getTransaction',
+      );
       if (!transaction) {
         return false;
       }
@@ -370,7 +475,10 @@ export class StellarService {
 
     this.validateConfiguration();
     try {
-      const transaction = await this.server.getTransaction(txHash);
+      const transaction = await this.withFailover(
+        (s) => s.getTransaction(txHash),
+        'getTransaction',
+      );
       if (!transaction) {
         return false;
       }
@@ -401,7 +509,10 @@ export class StellarService {
     this.validateConfiguration();
 
     try {
-      const transaction = await this.server.getTransaction(txHash);
+      const transaction = await this.withFailover(
+        (s) => s.getTransaction(txHash),
+        'getTransaction',
+      );
       if (!transaction) {
         return 'PENDING';
       }
@@ -443,7 +554,10 @@ export class StellarService {
   > {
     this.validateConfiguration();
     try {
-      const account = await this.server.loadAccount(accountId);
+      const account = await this.withFailover(
+        (s) => s.loadAccount(accountId),
+        'loadAccount',
+      );
       return (account.balances as any[]).map((b: any) => ({
         assetCode: b.asset_type === 'native' ? 'XLM' : b.asset_code,
         assetIssuer: b.asset_type === 'native' ? null : b.asset_issuer,
@@ -468,7 +582,10 @@ export class StellarService {
   async getNativeBalance(accountId: string): Promise<string> {
     this.validateConfiguration();
     try {
-      const account = await this.server.loadAccount(accountId);
+      const account = await this.withFailover(
+        (s) => s.loadAccount(accountId),
+        'loadAccount',
+      );
       const balances = account.balances as any[];
       const nativeBalance = balances.find(
         (b: any) => b.asset_type === 'native',
@@ -515,6 +632,36 @@ export class StellarService {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Health check endpoint for Stellar RPC URLs.
+   */
+  async getRpcHealth(): Promise<Record<string, { status: string; latencyMs?: number; error?: string }>> {
+    const results: Record<string, { status: string; latencyMs?: number; error?: string }> = {};
+
+    await Promise.all(
+      this.rpcUrls.map(async (url) => {
+        const tempServer = new (SorobanRpc as any).Server(url, {
+          allowHttp: url.startsWith('http://'),
+        });
+        const start = Date.now();
+        try {
+          await tempServer.getLatestLedger();
+          results[url] = {
+            status: 'UP',
+            latencyMs: Date.now() - start,
+          };
+        } catch (error) {
+          results[url] = {
+            status: 'DOWN',
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      })
+    );
+
+    return results;
   }
 
   private isTransientRpcFailure(error: unknown): boolean {
@@ -615,8 +762,14 @@ export class StellarService {
       .setTimeout(30)
       .build();
 
-    const preparedTx = await this.server.prepareTransaction(tx);
-    const simulation = await this.server.simulateTransaction(preparedTx);
+    const preparedTx = await this.withFailover(
+      (s) => s.prepareTransaction(tx),
+      'prepareTransaction',
+    );
+    const simulation = await this.withFailover(
+      (s) => s.simulateTransaction(preparedTx),
+      'simulateTransaction',
+    );
 
     if (isSimulateTransactionErrorResponse(simulation)) {
       throw new Error(formatSimulationError(simulation));
@@ -635,6 +788,20 @@ export class StellarService {
   }
 
   public async invokeContractMethod(
+    contractAddress: string,
+    method: string,
+  ): Promise<ContractInvocationResult> {
+    return withStellarSpan(
+      'stellar.simulate_transaction',
+      { network: this.networkPassphrase, contractAddress },
+      async (span) => {
+        span.setAttribute('stellar.method', method);
+        return this.invokeContractMethod_impl(contractAddress, method);
+      },
+    );
+  }
+
+  private async invokeContractMethod_impl(
     contractAddress: string,
     method: string,
   ): Promise<ContractInvocationResult> {
@@ -682,7 +849,10 @@ export class StellarService {
       };
     }
     if (typeof this.server.prepareTransaction === 'function') {
-      tx = await this.server.prepareTransaction(tx);
+      tx = await this.withFailover(
+        (s) => s.prepareTransaction(tx),
+        'prepareTransaction',
+      );
     }
 
     let lastError: unknown;
@@ -690,7 +860,10 @@ export class StellarService {
       attempts = attempt + 1;
       try {
         const simStart = Date.now();
-        const simulation = await this.server.simulateTransaction(tx);
+        const simulation = await this.withFailover(
+          (s) => s.simulateTransaction(tx),
+          'simulateTransaction',
+        );
         simulationLatencyMs += Date.now() - simStart;
 
         if (isSimulateTransactionErrorResponse(simulation)) {
@@ -960,9 +1133,9 @@ export class StellarService {
   }
 
   private validateConfiguration(): void {
-    if (!this.rpcUrl) {
+    if (this.rpcUrls.length === 0) {
       throw new InternalServerErrorException(
-        'Missing STELLAR_RPC_URL configuration',
+        'Missing STELLAR_RPC_URLS or STELLAR_RPC_URL configuration',
       );
     }
 

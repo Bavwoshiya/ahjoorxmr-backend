@@ -205,7 +205,7 @@ export class BalanceMonitorService {
     const minBalanceXlm = parseFloat(this.minBalanceAlertXlm.toString());
 
     try {
-      const account = await this.server.loadAccount(accountId);
+      const account = await (this.circuitBreakerService as any).execute(() => this.server.loadAccount(accountId));
       const balances = account.balances as any[];
 
       // Find native XLM balance

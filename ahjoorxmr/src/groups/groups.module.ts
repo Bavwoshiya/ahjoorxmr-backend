@@ -18,6 +18,7 @@ import { GroupInviteService } from './invites/group-invite.service';
 import { GroupInviteController } from './invites/group-invite.controller';
 import { MailModule } from '../mail/mail.module';
 import { User } from '../users/entities/user.entity';
+import { Penalty } from '../penalties/entities/penalty.entity';
 
 /**
  * GroupsModule manages ROSCA group entities in the database.
@@ -26,7 +27,7 @@ import { User } from '../users/entities/user.entity';
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Group, Membership, PayoutTransaction, GroupInvite, User]),
+    TypeOrmModule.forFeature([Group, Membership, PayoutTransaction, GroupInvite, User, Penalty]),
     NotificationsModule,
     StellarModule,
     QueueModule,

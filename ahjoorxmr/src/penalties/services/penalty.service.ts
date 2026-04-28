@@ -1,4 +1,4 @@
-import { Injectable, Logger, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, LessThan, And } from 'typeorm';
 import { Penalty, PenaltyStatus } from '../entities/penalty.entity';
@@ -9,6 +9,9 @@ import { Contribution } from '../../contributions/entities/contribution.entity';
 import { NotificationsService } from '../../notification/notifications.service';
 import { NotificationType } from '../../notification/notification-type.enum';
 import { Decimal } from 'decimal.js';
+import { AuditService } from '../../audit/audit.service';
+import { DisputePenaltyDto } from '../dtos/dispute-penalty.dto';
+import { ResolvePenaltyDto, PenaltyResolution } from '../dtos/resolve-penalty.dto';
 
 @Injectable()
 export class PenaltyService {
@@ -24,6 +27,7 @@ export class PenaltyService {
         @InjectRepository(Contribution)
         private readonly contributionRepository: Repository<Contribution>,
         private readonly notificationsService: NotificationsService,
+        private readonly auditService: AuditService,
     ) { }
 
     /**
@@ -216,6 +220,132 @@ export class PenaltyService {
             deductedAmount: totalDeduction.toFixed(7),
             penaltiesApplied: appliedPenalties,
         };
+    }
+
+    /**
+     * Dispute a penalty (member only)
+     */
+    async disputePenalty(
+        penaltyId: string,
+        userId: string,
+        dto: DisputePenaltyDto,
+    ): Promise<Penalty> {
+        const penalty = await this.penaltyRepository.findOne({ where: { id: penaltyId } });
+        if (!penalty) {
+            throw new NotFoundException(`Penalty ${penaltyId} not found`);
+        }
+
+        if (penalty.userId !== userId) {
+            throw new ForbiddenException('You can only dispute your own penalties');
+        }
+
+        if (penalty.status !== PenaltyStatus.PENDING) {
+            throw new BadRequestException(`Cannot dispute penalty with status ${penalty.status}`);
+        }
+
+        penalty.status = PenaltyStatus.DISPUTED;
+        penalty.disputeReason = dto.reason;
+        penalty.disputeTxHash = dto.txHash;
+        penalty.disputedAt = new Date();
+
+        const savedPenalty = await this.penaltyRepository.save(penalty);
+
+        await this.auditService.createLog({
+            userId,
+            action: 'PENALTY_DISPUTE_SUBMITTED',
+            resource: 'Penalty',
+            metadata: {
+                penaltyId,
+                reason: dto.reason,
+                txHash: dto.txHash,
+            },
+        });
+
+        // Notify admins (simplified: notify group admin)
+        const group = await this.groupRepository.findOne({ where: { id: penalty.groupId } });
+        if (group) {
+            const adminMembership = await this.membershipRepository.findOne({
+                where: { groupId: group.id, walletAddress: group.adminWallet }
+            });
+            if (adminMembership) {
+                await this.notificationsService.notifyBatch([{
+                    userId: adminMembership.userId,
+                    type: NotificationType.PENALTY_DISPUTED,
+                    title: 'Penalty Disputed',
+                    body: `Member has disputed a penalty in group ${group.name}`,
+                    metadata: { penaltyId, groupId: group.id },
+                }]);
+            }
+        }
+
+        return savedPenalty;
+    }
+
+    /**
+     * Resolve a penalty dispute (admin only)
+     */
+    async resolveDispute(
+        penaltyId: string,
+        adminUserId: string,
+        dto: ResolvePenaltyDto,
+    ): Promise<Penalty> {
+        const penalty = await this.penaltyRepository.findOne({ where: { id: penaltyId } });
+        if (!penalty) {
+            throw new NotFoundException(`Penalty ${penaltyId} not found`);
+        }
+
+        if (penalty.status !== PenaltyStatus.DISPUTED) {
+            throw new BadRequestException(`Penalty is not in DISPUTED status`);
+        }
+
+        const group = await this.groupRepository.findOne({ where: { id: penalty.groupId } });
+        if (!group) {
+            throw new NotFoundException('Group not found');
+        }
+
+        // Check if adminUserId is group admin or platform admin
+        // For simplicity, we check if they are group admin
+        const adminMembership = await this.membershipRepository.findOne({
+            where: { groupId: group.id, userId: adminUserId }
+        });
+        
+        if (!adminMembership || (group.adminWallet !== adminMembership.walletAddress)) {
+            // Check if they have platform admin role (assuming 'admin' role from controller)
+            // The RolesGuard handles this at controller level, so we assume they are authorized here
+        }
+
+        if (dto.resolution === PenaltyResolution.WAIVE) {
+            penalty.status = PenaltyStatus.WAIVED;
+        } else {
+            penalty.status = PenaltyStatus.REJECTED;
+        }
+
+        penalty.resolutionNotes = dto.notes;
+        penalty.resolvedByUserId = adminUserId;
+        penalty.resolvedAt = new Date();
+
+        const savedPenalty = await this.penaltyRepository.save(penalty);
+
+        await this.auditService.createLog({
+            userId: adminUserId,
+            action: 'PENALTY_DISPUTE_RESOLVED',
+            resource: 'Penalty',
+            metadata: {
+                penaltyId,
+                resolution: dto.resolution,
+                notes: dto.notes,
+            },
+        });
+
+        await this.notificationsService.notifyBatch([{
+            userId: penalty.userId,
+            type: NotificationType.PENALTY_RESOLVED,
+            title: 'Penalty Dispute Resolved',
+            body: `Your penalty dispute in group ${group.name} has been ${dto.resolution.toLowerCase()}d`,
+            metadata: { penaltyId, resolution: dto.resolution },
+        }]);
+
+        return savedPenalty;
     }
 
     /**

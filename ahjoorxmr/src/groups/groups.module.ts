@@ -18,6 +18,9 @@ import { GroupInviteService } from './invites/group-invite.service';
 import { GroupInviteController } from './invites/group-invite.controller';
 import { MailModule } from '../mail/mail.module';
 import { User } from '../users/entities/user.entity';
+import { Announcement } from './entities/announcement.entity';
+import { AnnouncementsService } from './announcements.service';
+import { AnnouncementsController } from './announcements.controller';
 import { AuditModule } from '../audit/audit.module';
 
 /**
@@ -27,14 +30,14 @@ import { AuditModule } from '../audit/audit.module';
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Group, Membership, PayoutTransaction, GroupInvite, User]),
+    TypeOrmModule.forFeature([Group, Membership, PayoutTransaction, GroupInvite, User, Announcement]),
     NotificationsModule,
     StellarModule,
     QueueModule,
     MailModule,
     AuditModule,
   ],
-  controllers: [GroupsController, GroupsV2Controller, GroupInviteController],
+  controllers: [GroupsController, GroupsV2Controller, GroupInviteController, AnnouncementsController],
   providers: [
     GroupsService,
     RoundService,
@@ -42,6 +45,7 @@ import { AuditModule } from '../audit/audit.module';
     WinstonLogger,
     JwtAuthGuard,
     GroupInviteService,
+    AnnouncementsService,
   ],
   exports: [GroupsService, RoundService, PayoutService, GroupInviteService],
 })
